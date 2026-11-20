@@ -136,3 +136,44 @@ def test_health_needs_no_api_key(system):
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+
+
+
+
+# 5(c) Concurrency (REQ-2)
+
+
+def test_ten_students_racing_for_three_seats_get_exactly_three(system):
+    """REQ-2, REQ-5: 10 simultaneous requests for SE499 (3 seats) -> exactly 3 enrolled."""
+    students = [f"S{n:02d}" for n in range(1, 11)]       # S01..S10, all eligible
+    barrier = threading.Barrier(len(students))
+    statuses = {}
+
+    def request_seat(student_id):
+        barrier.wait(timeout=10)                         # all threads start together
+        response = requests.post(
+            f"{system.url}/enrollments", timeout=30,
+            headers={"X-API-Key": API_KEY},
+            json={"student_id": student_id, "course_code": "SE499"},
+        )
+        statuses[student_id] = response.status_code
+
+    threads = [threading.Thread(target=request_seat, args=(s,)) for s in students]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    # HTTP responses: exactly 3 enrolled, 7 refused as full
+    assert Counter(statuses.values()) == {201: 3, 409: 7}
+    # the database never over-fills
+    assert system.get("/courses/SE499").json()["seats_taken"] == 3
+    # the outbox agrees with the responses
+    outbox = [m for m in system.outbox() if m["course_code"] == "SE499"]
+    confirmed = {m["student_id"] for m in outbox if m["type"] == "confirmation"}
+    rejected = [m for m in outbox if m["type"] == "rejection"]
+    assert len(confirmed) == 3 and len(rejected) == 7
+    assert all(m["reason"] == "course is full" for m in rejected)
+    assert confirmed == {s for s, code in statuses.items() if code == 201}
