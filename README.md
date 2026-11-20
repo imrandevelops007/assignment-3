@@ -156,3 +156,131 @@ calls `remove_enrollment(student_id, course_code)` and then
 `release_seat(course_code)`, which the service does correctly. The defect is in the
 SQL the real repository sends to SQLite (IP4), so only a test against a real
 database with two students enrolled can see it.
+
+
+
+---
+
+## Section 5: System Testing
+
+System tests use the provided `system` fixture, which starts `serve.py` as a
+separate process with a fresh database seeded as in `SPEC.md`. They observe the
+system only through HTTP and the outbox; `tests/system/` imports nothing from `src/`.
+
+### 5(a) End-to-end scenarios
+
+| Test | Scenario | Checks |
+|---|---|---|
+| `test_main_success_scenario_student_enrolls_and_everything_agrees` | S01 (completed CIS350) enrolls in SE413 | 201 with fee $300; schedule lists SE413 with 3 credits and $300; `seats_taken` is 1; outbox holds one confirmation with fee 300.0 |
+| `test_alternative_flow_missing_prerequisite_is_refused_and_notified` | S13 (completed nothing) tries SE413, which needs CIS350 | 422 `prerequisite CIS350 not completed`; schedule empty with fee $0; `seats_taken` is 0; outbox holds one rejection with that reason |
+
+### 5(b) Robustness and security (REQ-8)
+
+- `test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing` is
+  parametrized over 11 bodies: missing fields, wrong types (number, `null`),
+  non-object bodies (list, string), malformed JSON, an empty body, SQL injection,
+  script injection, and a 10,000-character id. Each gets a JSON `400`, no seat is
+  taken, S01's schedule stays empty, and the outbox stays empty.
+- `test_every_endpoint_except_health_requires_the_api_key` is parametrized over all
+  four endpoints × (no key, wrong key). Each gets a JSON `401` and changes nothing.
+  The DELETE case targets S14's real MTH201 enrollment, which is still there afterwards.
+- `test_health_needs_no_api_key` confirms `/health` answers `200` without a key.
+
+### 5(c) Concurrency (REQ-2)
+
+`test_ten_students_racing_for_three_seats_get_exactly_three` starts one thread per
+student (S01–S10), releases them together with a `threading.Barrier`, and has each
+send `POST /enrollments` for SE499 (3 seats). It asserts exactly three `201`s and
+seven `409`s, `seats_taken == 3`, and three confirmations and seven
+`course is full` rejections in the outbox, for the same three students who got `201`.
+
+**Why this must be a system test rather than an integration test:** the integration
+tests call the service one call at a time on a single shared connection inside the
+test process, so two enrollments can never actually overlap. The race only exists in
+the running system, where `serve.py`'s threaded server handles each request on its
+own thread with its own database connection. Only real simultaneous HTTP requests
+exercise the locking that REQ-2 depends on.
+
+
+
+
+---
+
+## Section 6: Organizing and Running the Test Suite
+
+### 6(a) Markers and commands
+
+Every test carries one marker, applied to the whole file with `pytestmark`:
+
+| Marker | File | Tests |
+|---|---|---|
+| `integration` | `tests/integration/test_integration.py` | 9 (8 pass, 1 strict xfail) |
+| `system` | `tests/system/test_system.py` | 23 |
+
+Run from the project root with the virtual environment activated
+(`pip install -r requirements.txt`):
+
+```
+pytest                    # full suite
+pytest -v                 # full suite, one line per test
+pytest -m integration     # integration tests only
+pytest -m system          # system tests only (each starts its own server)
+pytest -m integration --runxfail -k only_that   # show the known defect's actual failure
+```
+
+Every requirement a test checks is listed (REQ-1 to REQ-8) in that test's docstring.
+
+**Test independence:** every integration fixture is function-scoped, so each test
+gets a brand-new SQLite file in its own `tmp_path` and a fresh `FakeNotifier`. Each
+system test gets its own `serve.py` process with a freshly seeded database and an
+empty outbox. No test depends on another's data or execution order.
+
+### 6(b) Evidence that the full suite passes
+
+The strict xfail from 4(d) is the only test that does not pass.
+
+```
+(.venv) PS E:\assignment-3> pytest -v
+================================== test session starts ==================================
+platform win32 -- Python 3.13.5, pytest-9.2.0, pluggy-1.7.0 -- E:\assignment-3\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: E:\assignment-3
+configfile: pyproject.toml
+testpaths: tests
+collected 32 items
+
+tests/integration/test_integration.py::test_take_seat_fills_last_seat_then_refuses_without_changing_anything PASSED [  3%]
+tests/integration/test_integration.py::test_duplicate_enrollment_is_rejected_by_the_database PASSED [  6%]
+tests/integration/test_integration.py::test_current_credits_counts_only_that_students_courses PASSED [  9%]
+tests/integration/test_integration.py::test_transaction_failing_part_way_leaves_neither_seat_nor_enrollment PASSED [ 12%]
+tests/integration/test_integration.py::test_successful_enrollment_saves_enrollment_takes_seat_and_confirms_fee PASSED [ 15%]
+tests/integration/test_integration.py::test_full_course_raises_course_full_and_sends_rejection PASSED [ 18%]
+tests/integration/test_integration.py::test_duplicate_enrollment_raises_already_enrolled_and_sends_nothing PASSED [ 21%]
+tests/integration/test_integration.py::test_withdraw_with_one_student_frees_the_seat PASSED [ 25%]
+tests/integration/test_integration.py::test_withdraw_removes_only_that_students_enrollment XFAIL [ 28%]
+tests/system/test_system.py::test_main_success_scenario_student_enrolls_and_everything_agrees PASSED [ 31%]
+tests/system/test_system.py::test_alternative_flow_missing_prerequisite_is_refused_and_notified PASSED [ 34%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[missing-course_code] PASSED [ 37%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[missing-both-fields] PASSED [ 40%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[wrong-type-number] PASSED [ 43%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[wrong-type-null] PASSED [ 46%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[non-object-list] PASSED [ 50%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[non-object-string] PASSED [ 53%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[malformed-json] PASSED [ 56%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[empty-body] PASSED [ 59%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[sql-injection] PASSED [ 62%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[script-injection] PASSED [ 65%]
+tests/system/test_system.py::test_invalid_or_hostile_enrollment_body_gets_json_400_and_changes_nothing[oversized-id] PASSED [ 68%]
+tests/system/test_system.py::test_every_endpoint_except_health_requires_the_api_key[POST-enrollments-no-key] PASSED [ 71%]
+tests/system/test_system.py::test_every_endpoint_except_health_requires_the_api_key[POST-enrollments-wrong-key] PASSED [ 75%]
+tests/system/test_system.py::test_every_endpoint_except_health_requires_the_api_key[DELETE-enrollment-no-key] PASSED [ 78%]
+tests/system/test_system.py::test_every_endpoint_except_health_requires_the_api_key[DELETE-enrollment-wrong-key] PASSED [ 81%]
+tests/system/test_system.py::test_every_endpoint_except_health_requires_the_api_key[GET-schedule-no-key] PASSED [ 84%]
+tests/system/test_system.py::test_every_endpoint_except_health_requires_the_api_key[GET-schedule-wrong-key] PASSED [ 87%]
+tests/system/test_system.py::test_every_endpoint_except_health_requires_the_api_key[GET-course-no-key] PASSED [ 90%]
+tests/system/test_system.py::test_every_endpoint_except_health_requires_the_api_key[GET-course-wrong-key] PASSED [ 93%]
+tests/system/test_system.py::test_health_needs_no_api_key PASSED                   [ 96%]
+tests/system/test_system.py::test_ten_students_racing_for_three_seats_get_exactly_three PASSED [100%]
+
+============================ 31 passed, 1 xfailed in 32.30s =============================
+```
